@@ -1,6 +1,6 @@
 import type { CornerPoint, EnhancementPreset, EnhancementSettings } from '../types';
 
-const MAX_DIMENSION = 2000;
+const MAX_DIMENSION = 1600;
 
 export const DEFAULT_ENHANCEMENT_SETTINGS: EnhancementSettings = {
   corners: [
@@ -256,7 +256,7 @@ function dist(a: { x: number; y: number }, b: { x: number; y: number }): number 
 
 /**
  * Aplica recorte de bordes, corrección de perspectiva (homografía),
- * rotación, blanqueo de fondo y aumento de contraste, limitando el lado mayor a 2000 px.
+ * rotación, blanqueo de fondo y aumento de contraste, limitando el lado mayor a 1600 px.
  */
 export async function processPageImage(
   originalDataUrl: string,
@@ -292,7 +292,7 @@ export async function processPageImage(
   let outW = Math.max(200, Math.round(Math.max(topWidth, bottomWidth)));
   let outH = Math.max(200, Math.round(Math.max(leftHeight, rightHeight)));
 
-  // Clamp max side <= 2000px
+  // Clamp max side <= 1600px
   if (Math.max(outW, outH) > maxOutputDimension) {
     const scale = maxOutputDimension / Math.max(outW, outH);
     outW = Math.round(outW * scale);
@@ -402,10 +402,48 @@ export async function processPageImage(
   }
 
   return {
-    processedDataUrl: finalCanvas.toDataURL('image/jpeg', 0.88),
+    processedDataUrl: finalCanvas.toDataURL('image/jpeg', 0.8),
     width: finalCanvas.width,
     height: finalCanvas.height,
   };
+}
+
+/**
+ * Reduce cualquier imagen a un máximo de `maxSide` px por lado (por defecto 1600 px)
+ * y la comprime como JPEG (calidad 0.8) antes de enviarla a Gemini.
+ */
+export async function compressImageForGemini(
+  dataUrl: string,
+  maxSide = 1600,
+  quality = 0.8,
+): Promise<string> {
+  const img = await loadImageElement(dataUrl);
+  const srcW = img.naturalWidth || img.width;
+  const srcH = img.naturalHeight || img.height;
+
+  let targetW = Math.max(1, srcW);
+  let targetH = Math.max(1, srcH);
+
+  const longestSide = Math.max(targetW, targetH);
+  if (longestSide > maxSide) {
+    const scale = maxSide / longestSide;
+    targetW = Math.max(1, Math.round(targetW * scale));
+    targetH = Math.max(1, Math.round(targetH * scale));
+  }
+
+  const canvas = document.createElement('canvas');
+  canvas.width = targetW;
+  canvas.height = targetH;
+  const ctx = canvas.getContext('2d');
+  if (!ctx) {
+    return dataUrl;
+  }
+
+  ctx.fillStyle = '#ffffff';
+  ctx.fillRect(0, 0, targetW, targetH);
+  ctx.drawImage(img, 0, 0, targetW, targetH);
+
+  return canvas.toDataURL('image/jpeg', quality);
 }
 
 /**

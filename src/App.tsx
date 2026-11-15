@@ -23,6 +23,7 @@ import {
 import {
   analyzeHandwrittenPages,
   buildScanPages,
+  hasStoredApiKey,
   OcrServiceError,
 } from './services/geminiService';
 import {
@@ -39,6 +40,7 @@ import { StagingView } from './components/StagingView';
 import { ResultsView } from './components/ResultsView';
 import { HistoryView } from './components/HistoryView';
 import { SettingsView } from './components/SettingsView';
+import { ApiKeyOnboardingView } from './components/ApiKeyOnboardingView';
 import { PWAInstallButton } from './components/PWAInstallButton';
 
 const THEME_STORAGE_KEY = 'inkbridge-theme';
@@ -77,15 +79,20 @@ export default function App() {
   const [isDemoSession, setIsDemoSession] = useState(false);
   const [activeScan, setActiveScan] = useState<ScanRecord | null>(null);
 
+  const [hasKey, setHasKey] = useState<boolean>(() => hasStoredApiKey());
+
   const [isCameraOpen, setIsCameraOpen] = useState(false);
   const [isPreparingImages, setIsPreparingImages] = useState(false);
   const [isPreparingDemo, setIsPreparingDemo] = useState(false);
+  const [isProcessingOcr, setIsProcessingOcr] = useState(false);
   const [ocrError, setOcrError] = useState<string | null>(null);
+  const [ocrTechnicalError, setOcrTechnicalError] = useState<string | null>(null);
   const [isRetryingOcr, setIsRetryingOcr] = useState(false);
 
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const nativeCameraInputRef = useRef<HTMLInputElement | null>(null);
   const saveTimerRef = useRef<number | null>(null);
+  const pendingScanIntentRef = useRef<'camera' | 'upload' | 'process' | null>(null);
 
   // Sync themeMode ('light' | 'dark' | 'auto') with document.documentElement
   useEffect(() => {
@@ -169,6 +176,12 @@ export default function App() {
 
   const startCameraFlow = () => {
     setOcrError(null);
+    setOcrTechnicalError(null);
+    if (!hasStoredApiKey()) {
+      pendingScanIntentRef.current = 'camera';
+      setView('onboarding');
+      return;
+    }
     if (!isOnline) {
       setOcrError(
         'Sin conexión a internet. Necesitas conexión para escanear nuevas páginas, pero puedes abrir tu historial y exportar PDFs.',
@@ -181,6 +194,12 @@ export default function App() {
 
   const startUploadFlow = () => {
     setOcrError(null);
+    setOcrTechnicalError(null);
+    if (!hasStoredApiKey()) {
+      pendingScanIntentRef.current = 'upload';
+      setView('onboarding');
+      return;
+    }
     if (!isOnline) {
       setOcrError(
         'Sin conexión a internet. Necesitas conexión para procesar imágenes nuevas, pero puedes consultar tu historial y exportar PDFs.',
@@ -194,11 +213,14 @@ export default function App() {
   const handleStartDemo = async () => {
     setIsPreparingDemo(true);
     setOcrError(null);
+    setOcrTechnicalError(null);
     try {
       const demoPages = await createDemoStagedPages();
       setStagedPages(demoPages);
       setIsDemoSession(true);
       setView('staging');
+    } catch {
+      setOcrError('No pudimos preparar las páginas de ejemplo.');
     } finally {
       setIsPreparingDemo(false);
     }
@@ -217,16 +239,25 @@ export default function App() {
   };
 
   const handleProcessStagedPages = async () => {
-    if (stagedPages.length === 0) return;
+    if (stagedPages.length === 0 || isProcessingOcr) return;
+
+    if (!isDemoSession && !hasStoredApiKey()) {
+      pendingScanIntentRef.current = 'process';
+      setView('onboarding');
+      return;
+    }
 
     if (!isDemoSession && !isOnline) {
       setOcrError(
         'Sin conexión a internet. Conéctate para enviar tus páginas a Gemini.',
       );
+      setOcrTechnicalError(null);
       return;
     }
 
     setOcrError(null);
+    setOcrTechnicalError(null);
+    setIsProcessingOcr(true);
     setView('processing');
 
     try {
@@ -259,23 +290,40 @@ export default function App() {
       await persistScanRecord(newScan);
       setView('results');
     } catch (err) {
-      const message =
-        err instanceof OcrServiceError
-          ? err.message
-          : 'Ocurrió un error inesperado al leer tus notas. Inténtalo nuevamente.';
-      setOcrError(message);
+      if (err instanceof OcrServiceError) {
+        if (err.code === 'MISSING_API_KEY') {
+          pendingScanIntentRef.current = 'process';
+          setHasKey(false);
+          setView('onboarding');
+          return;
+        }
+        setOcrError(err.message);
+        setOcrTechnicalError(err.technicalDetail ?? null);
+      } else {
+        setOcrError('Ocurrió un error inesperado al leer tus notas. Inténtalo nuevamente.');
+        setOcrTechnicalError(err instanceof Error ? err.message : String(err));
+      }
+    } finally {
+      setIsProcessingOcr(false);
     }
   };
 
   const handleRetryOcrFromResults = async () => {
-    if (!activeScan) return;
+    if (!activeScan || isRetryingOcr) return;
+    if (!hasStoredApiKey()) {
+      setHasKey(false);
+      setView('onboarding');
+      return;
+    }
     if (!isOnline) {
       setOcrError('Sin conexión a internet. Conéctate para volver a leer esta página.');
+      setOcrTechnicalError(null);
       return;
     }
 
     setIsRetryingOcr(true);
     setOcrError(null);
+    setOcrTechnicalError(null);
 
     try {
       const ocrResult = await analyzeHandwrittenPages(
@@ -296,11 +344,18 @@ export default function App() {
       setActiveScan(updatedScan);
       await persistScanRecord(updatedScan);
     } catch (err) {
-      const message =
-        err instanceof OcrServiceError
-          ? err.message
-          : 'No pudimos repetir la lectura en este momento.';
-      setOcrError(message);
+      if (err instanceof OcrServiceError) {
+        if (err.code === 'MISSING_API_KEY') {
+          setHasKey(false);
+          setView('onboarding');
+          return;
+        }
+        setOcrError(err.message);
+        setOcrTechnicalError(err.technicalDetail ?? null);
+      } else {
+        setOcrError('No pudimos repetir la lectura en este momento.');
+        setOcrTechnicalError(err instanceof Error ? err.message : String(err));
+      }
     } finally {
       setIsRetryingOcr(false);
     }
@@ -339,7 +394,27 @@ export default function App() {
   const handleOpenScan = (scan: ScanRecord) => {
     setActiveScan(scan);
     setOcrError(null);
+    setOcrTechnicalError(null);
     setView('results');
+  };
+
+  const handleOnboardingSuccess = () => {
+    setHasKey(true);
+    const intent = pendingScanIntentRef.current;
+    pendingScanIntentRef.current = null;
+    if (intent === 'camera') {
+      setView('home');
+      setStagedPages([]);
+      setIsCameraOpen(true);
+    } else if (intent === 'upload') {
+      setView('home');
+      setStagedPages([]);
+      fileInputRef.current?.click();
+    } else if (intent === 'process' && stagedPages.length > 0) {
+      void handleProcessStagedPages();
+    } else {
+      setView('home');
+    }
   };
 
   return (
@@ -457,12 +532,20 @@ export default function App() {
               className="bg-red-50 dark:bg-red-950/40 border border-red-200 dark:border-red-900/70 rounded-2xl p-4 flex items-start gap-3"
             >
               <AlertCircle className="w-5 h-5 text-red-600 dark:text-red-400 shrink-0 mt-0.5" />
-              <div className="flex-1 min-w-0 text-sm text-red-800 dark:text-red-200">
-                {ocrError}
+              <div className="flex-1 min-w-0 space-y-1">
+                <p className="text-sm text-red-800 dark:text-red-200">{ocrError}</p>
+                {ocrTechnicalError && (
+                  <p className="text-[11px] font-mono text-red-700/80 dark:text-red-300/80 break-words">
+                    {ocrTechnicalError}
+                  </p>
+                )}
               </div>
               <button
                 type="button"
-                onClick={() => setOcrError(null)}
+                onClick={() => {
+                  setOcrError(null);
+                  setOcrTechnicalError(null);
+                }}
                 className="text-xs font-semibold text-red-700 dark:text-red-300 hover:underline shrink-0"
               >
                 Cerrar
@@ -488,6 +571,20 @@ export default function App() {
                     nombra el archivo automáticamente, transcribe tu letra y convierte tus casillas en
                     listas interactivas.
                   </p>
+                  {!hasKey && (
+                    <div className="p-3.5 rounded-2xl bg-orange-50 dark:bg-orange-950/30 border border-orange-200/80 dark:border-orange-900/60 flex flex-wrap items-center justify-between gap-3">
+                      <p className="text-xs sm:text-sm text-orange-900 dark:text-orange-200">
+                        Conecta tu clave gratuita de Gemini para empezar a escanear.
+                      </p>
+                      <button
+                        type="button"
+                        onClick={() => setView('onboarding')}
+                        className="min-h-[36px] px-3.5 rounded-xl bg-orange-600 hover:bg-orange-500 text-white text-xs font-semibold whitespace-nowrap"
+                      >
+                        Configurar clave
+                      </button>
+                    </div>
+                  )}
                 </div>
 
                 {/* Large thumb-friendly primary CTAs */}
@@ -640,6 +737,21 @@ export default function App() {
           </div>
         )}
 
+        {/* ONBOARDING VIEW (first scan without API key) */}
+        {view === 'onboarding' && (
+          <ApiKeyOnboardingView
+            onSuccess={handleOnboardingSuccess}
+            onTryDemo={() => {
+              pendingScanIntentRef.current = null;
+              handleStartDemo();
+            }}
+            onCancel={() => {
+              pendingScanIntentRef.current = null;
+              setView('home');
+            }}
+          />
+        )}
+
         {/* SETTINGS VIEW */}
         {view === 'settings' && (
           <SettingsView
@@ -647,6 +759,7 @@ export default function App() {
             historyCount={history.length}
             onChangeTheme={setThemeMode}
             onClearHistory={handleClearAllHistory}
+            onApiKeyChanged={setHasKey}
             onBackHome={() => setView('home')}
           />
         )}
@@ -671,41 +784,7 @@ export default function App() {
         {/* PROCESSING / ERROR VIEW */}
         {view === 'processing' && (
           <div className="max-w-lg mx-auto px-4 py-16 sm:py-24">
-            {ocrError ? (
-              <div className="bg-white dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-800 rounded-3xl p-7 text-center space-y-5">
-                <div className="w-14 h-14 rounded-2xl bg-red-50 dark:bg-red-950/50 text-red-600 dark:text-red-400 flex items-center justify-center mx-auto">
-                  <AlertCircle className="w-7 h-7" />
-                </div>
-                <div className="space-y-2">
-                  <h2 className="text-xl font-bold text-zinc-900 dark:text-white">
-                    No pudimos leer tus páginas
-                  </h2>
-                  <p className="text-sm text-zinc-600 dark:text-zinc-300 leading-relaxed">
-                    {ocrError}
-                  </p>
-                </div>
-                <div className="flex flex-col sm:flex-row gap-3 pt-2">
-                  <button
-                    type="button"
-                    onClick={handleProcessStagedPages}
-                    className="flex-1 min-h-[48px] px-5 rounded-xl bg-orange-600 hover:bg-orange-500 text-white text-sm font-semibold inline-flex items-center justify-center gap-2"
-                  >
-                    <RefreshCw className="w-4 h-4" />
-                    <span>Reintentar lectura</span>
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => {
-                      setOcrError(null);
-                      setView('staging');
-                    }}
-                    className="flex-1 min-h-[48px] px-5 rounded-xl border border-zinc-200 dark:border-zinc-700 text-sm font-semibold text-zinc-800 dark:text-zinc-100"
-                  >
-                    Editar imágenes
-                  </button>
-                </div>
-              </div>
-            ) : (
+            {isProcessingOcr ? (
               <div className="bg-white dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-800 rounded-3xl p-8 text-center space-y-5">
                 <div className="w-12 h-12 rounded-full border-3 border-zinc-200 dark:border-zinc-700 border-t-orange-600 animate-spin mx-auto" />
                 <div className="space-y-1.5">
@@ -716,6 +795,46 @@ export default function App() {
                     Analizando {stagedPages.length}{' '}
                     {stagedPages.length === 1 ? 'página manuscrita' : 'páginas manuscritas'}
                   </p>
+                </div>
+              </div>
+            ) : (
+              <div className="bg-white dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-800 rounded-3xl p-7 text-center space-y-5">
+                <div className="w-14 h-14 rounded-2xl bg-red-50 dark:bg-red-950/50 text-red-600 dark:text-red-400 flex items-center justify-center mx-auto">
+                  <AlertCircle className="w-7 h-7" />
+                </div>
+                <div className="space-y-2">
+                  <h2 className="text-xl font-bold text-zinc-900 dark:text-white">
+                    No pudimos leer tus páginas
+                  </h2>
+                  <p className="text-sm text-zinc-600 dark:text-zinc-300 leading-relaxed">
+                    {ocrError ?? 'Ocurrió un error al procesar tus imágenes.'}
+                  </p>
+                  {ocrTechnicalError && (
+                    <p className="text-[11px] font-mono text-zinc-500 dark:text-zinc-400 break-words pt-1">
+                      {ocrTechnicalError}
+                    </p>
+                  )}
+                </div>
+                <div className="flex flex-col sm:flex-row gap-3 pt-2">
+                  <button
+                    type="button"
+                    onClick={handleProcessStagedPages}
+                    className="flex-1 min-h-[48px] px-5 rounded-xl bg-orange-600 hover:bg-orange-500 text-white text-sm font-semibold inline-flex items-center justify-center gap-2"
+                  >
+                    <RefreshCw className="w-4 h-4" />
+                    <span>Reintentar</span>
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setOcrError(null);
+                      setOcrTechnicalError(null);
+                      setView('staging');
+                    }}
+                    className="flex-1 min-h-[48px] px-5 rounded-xl border border-zinc-200 dark:border-zinc-700 text-sm font-semibold text-zinc-800 dark:text-zinc-100"
+                  >
+                    Editar imágenes
+                  </button>
                 </div>
               </div>
             )}

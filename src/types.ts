@@ -82,5 +82,5 @@ export interface PdfExportOptions {
 }
 
 export type ThemeMode = 'light' | 'dark' | 'auto';
-export type AppView = 'home' | 'staging' | 'processing' | 'results' | 'history' | 'settings';
+export type AppView = 'home' | 'staging' | 'processing' | 'results' | 'history' | 'settings' | 'onboarding';
 export type ResultsTab = 'escaneo' | 'transcripcion' | 'listas';

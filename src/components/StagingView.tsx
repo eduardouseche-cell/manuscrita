@@ -137,7 +137,7 @@ export function StagingView({
             </h1>
             <p className="text-xs text-zinc-500 dark:text-zinc-400">
               {pages.length} {pages.length === 1 ? 'página lista' : 'páginas listas'}
-              {isDemoSession ? ' · Ejemplo demostrativo' : ' · Máx. 2000 px por lado'}
+              {isDemoSession ? ' · Ejemplo demostrativo' : ' · Máx. 1600 px por lado'}
             </p>
           </div>
         </div>

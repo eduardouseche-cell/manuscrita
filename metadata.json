@@ -2,5 +2,5 @@
   "name": "Manuscrita",
   "description": "Convierte páginas escritas a mano en PDFs digitales bien nombrados, con texto transcrito y listas interactivas.",
   "requestFramePermissions": ["camera"],
-  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+  "majorCapabilities": []
 }
