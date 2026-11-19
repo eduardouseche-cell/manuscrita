@@ -4,20 +4,36 @@ import { compressImageForGemini } from './imageProcessor';
 const API_KEY_STORAGE_KEY = 'manuscrita_gemini_api_key';
 const LEGACY_API_KEY_STORAGE_KEY = 'inkbridge_gemini_api_key';
 
-// Modelo multimodal estable disponible en nivel gratuito
-const GEMINI_MODEL = 'gemini-4-hydrogen';
+// Lista ordenada de modelos Gemini multimodales (puedes editar el orden o agregar respaldos aquí)
+export const GEMINI_MODELS: readonly string[] = [
+  'gemini-3.8-flash',
+  'gemini-3.5-flash-lite',
+];
+
 const GEMINI_API_BASE = 'https://generativelanguage.googleapis.com/v1beta/models';
 const REQUEST_TIMEOUT_MS = 60_000;
+const MAX_ATTEMPTS_PER_MODEL = 2; // Máximo 2 intentos por modelo (1 reintento tras 3s)
+const RETRY_BASE_DELAY_MS = 3_000;
 
 export class OcrServiceError extends Error {
   code: string;
   technicalDetail?: string;
+  model?: string;
+  httpStatus?: number;
 
-  constructor(message: string, code = 'OCR_ERROR', technicalDetail?: string) {
+  constructor(
+    message: string,
+    code = 'OCR_ERROR',
+    technicalDetail?: string,
+    model?: string,
+    httpStatus?: number,
+  ) {
     super(message);
     this.name = 'OcrServiceError';
     this.code = code;
     this.technicalDetail = technicalDetail;
+    this.model = model;
+    this.httpStatus = httpStatus;
   }
 }
 
@@ -26,6 +42,7 @@ export interface NormalizedOcrResult {
   origen_titulo: TitleOrigin;
   paginas: Array<{ numero: number; texto: string }>;
   listas: OcrListGroup[];
+  modelo?: string;
 }
 
 function createId(prefix: string): string {
@@ -33,6 +50,10 @@ function createId(prefix: string): string {
     return `${prefix}_${crypto.randomUUID()}`;
   }
   return `${prefix}_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => window.setTimeout(resolve, ms));
 }
 
 export function getStoredApiKey(): string {
@@ -180,9 +201,10 @@ function parseDataUrl(dataUrl: string): { mimeType: string; base64: string } {
 }
 
 function parseHttpErrorPayload(
+  model: string,
   status: number,
   rawBodyText: string,
-): { code: string; message: string; technicalDetail?: string } {
+): { code: string; message: string; technicalDetail: string } {
   let apiMessage = '';
   let apiStatus = '';
   let apiReasons: string[] = [];
@@ -208,18 +230,37 @@ function parseHttpErrorPayload(
   }
 
   const combinedDetail = [
+    `modelo: ${model}`,
     `HTTP ${status}`,
     apiStatus ? `(${apiStatus})` : '',
     apiReasons.length > 0 ? `[${apiReasons.join(', ')}]` : '',
     apiMessage ? `: ${apiMessage}` : '',
   ]
     .filter(Boolean)
-    .join(' ');
+    .join(' · ');
 
   if (status === 429 || apiStatus === 'RESOURCE_EXHAUSTED') {
     return {
       code: 'RATE_LIMIT',
-      message: 'Alcanzaste el límite gratuito de tu clave. Espera un momento e inténtalo de nuevo.',
+      message:
+        'Alcanzaste el límite gratuito de tu clave por hoy. Se reinicia a medianoche (hora del Pacífico), o inténtalo en un minuto si fue un límite por minuto.',
+      technicalDetail: combinedDetail,
+    };
+  }
+
+  if (
+    status === 503 ||
+    status === 500 ||
+    status === 502 ||
+    status === 504 ||
+    apiStatus === 'UNAVAILABLE' ||
+    apiStatus === 'INTERNAL'
+  ) {
+    return {
+      code: 'SERVER_OVERLOADED',
+      message:
+        'Gemini está saturado en este momento. Tus imágenes siguen guardadas: espera unos minutos y toca Reintentar.',
+      technicalDetail: combinedDetail,
     };
   }
 
@@ -253,9 +294,17 @@ function parseHttpErrorPayload(
     };
   }
 
+  if (status === 404 || apiStatus === 'NOT_FOUND') {
+    return {
+      code: 'MODEL_NOT_FOUND',
+      message: 'El modelo solicitado no está disponible en este momento.',
+      technicalDetail: combinedDetail,
+    };
+  }
+
   if (status === 400) {
     return {
-      code: 'OTHER_ERROR',
+      code: 'BAD_REQUEST',
       message: 'Gemini no pudo procesar esta solicitud (error 400). Inténtalo de nuevo.',
       technicalDetail: combinedDetail,
     };
@@ -268,13 +317,17 @@ function parseHttpErrorPayload(
   };
 }
 
-function mapNetworkOrTimeoutError(err: unknown): OcrServiceError {
+function mapNetworkOrTimeoutError(err: unknown, model?: string): OcrServiceError {
   if (err instanceof OcrServiceError) return err;
+
+  const modelPrefix = model ? `modelo: ${model}` : '';
 
   if ((err as { name?: string })?.name === 'AbortError') {
     return new OcrServiceError(
       'La lectura tardó demasiado. Inténtalo de nuevo',
       'TIMEOUT',
+      modelPrefix ? `${modelPrefix} · Tiempo límite de 60 s agotado` : undefined,
+      model,
     );
   }
 
@@ -282,6 +335,8 @@ function mapNetworkOrTimeoutError(err: unknown): OcrServiceError {
     return new OcrServiceError(
       'Sin conexión a internet. Verifica tu red e inténtalo de nuevo.',
       'OFFLINE',
+      modelPrefix || undefined,
+      model,
     );
   }
 
@@ -295,21 +350,25 @@ function mapNetworkOrTimeoutError(err: unknown): OcrServiceError {
     return new OcrServiceError(
       'No pudimos conectar con Gemini. Verifica tu conexión a internet e inténtalo de nuevo.',
       'OFFLINE',
+      modelPrefix ? `${modelPrefix} · ${rawMsg}` : rawMsg,
+      model,
     );
   }
 
   return new OcrServiceError(
     'Ocurrió un error inesperado al procesar la solicitud.',
     'OTHER_ERROR',
-    rawMsg,
+    modelPrefix ? `${modelPrefix} · ${rawMsg}` : rawMsg,
+    model,
   );
 }
 
-async function fetchGeminiGenerateContent(
+async function fetchSingleModelGenerateContent(
+  model: string,
   apiKey: string,
   body: Record<string, unknown>,
 ): Promise<Record<string, unknown>> {
-  const endpoint = `${GEMINI_API_BASE}/${encodeURIComponent(GEMINI_MODEL)}:generateContent`;
+  const endpoint = `${GEMINI_API_BASE}/${encodeURIComponent(model)}:generateContent`;
   const controller = new AbortController();
   const timeoutId = window.setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
 
@@ -327,24 +386,108 @@ async function fetchGeminiGenerateContent(
     const responseText = await response.text();
 
     if (!response.ok) {
-      const parsedErr = parseHttpErrorPayload(response.status, responseText);
-      throw new OcrServiceError(parsedErr.message, parsedErr.code, parsedErr.technicalDetail);
+      const parsedErr = parseHttpErrorPayload(model, response.status, responseText);
+      throw new OcrServiceError(
+        parsedErr.message,
+        parsedErr.code,
+        parsedErr.technicalDetail,
+        model,
+        response.status,
+      );
     }
 
     try {
       return JSON.parse(responseText) as Record<string, unknown>;
     } catch (parseErr) {
+      const msg = parseErr instanceof Error ? parseErr.message : 'JSON parse error';
       throw new OcrServiceError(
         'La respuesta de Gemini no llegó en un formato JSON válido.',
         'OTHER_ERROR',
-        parseErr instanceof Error ? parseErr.message : 'JSON parse error',
+        `modelo: ${model} · ${msg}`,
+        model,
       );
     }
   } catch (err) {
-    throw mapNetworkOrTimeoutError(err);
+    throw mapNetworkOrTimeoutError(err, model);
   } finally {
     window.clearTimeout(timeoutId);
   }
+}
+
+/**
+ * Ejecuta la llamada recorriendo la lista ordenada GEMINI_MODELS:
+ * - 400/403 de clave inválida -> falla de inmediato sin reintentar ni cambiar de modelo.
+ * - 429 (cuota) -> pasa de inmediato al siguiente modelo sin reintentar el mismo.
+ * - 503/500 -> reintenta una vez tras 3s (máximo 2 intentos por modelo con espera creciente);
+ *   si vuelve a fallar, pasa al siguiente modelo.
+ */
+async function fetchGeminiWithFallback(
+  apiKey: string,
+  body: Record<string, unknown>,
+): Promise<{ json: Record<string, unknown>; model: string }> {
+  let lastError: OcrServiceError | null = null;
+  const attemptTrace: string[] = [];
+
+  for (const model of GEMINI_MODELS) {
+    for (let attempt = 1; attempt <= MAX_ATTEMPTS_PER_MODEL; attempt++) {
+      try {
+        const json = await fetchSingleModelGenerateContent(model, apiKey, body);
+        return { json, model };
+      } catch (err) {
+        const mapped = mapNetworkOrTimeoutError(err, model);
+        lastError = mapped;
+        if (mapped.technicalDetail) {
+          attemptTrace.push(mapped.technicalDetail);
+        }
+
+        // Clave inválida / permisos, solicitud inválida, red caída o timeout: detener de inmediato
+        if (
+          mapped.code === 'INVALID_API_KEY' ||
+          mapped.code === 'BAD_REQUEST' ||
+          mapped.code === 'OFFLINE' ||
+          mapped.code === 'TIMEOUT'
+        ) {
+          throw mapped;
+        }
+
+        // 429 (cuota) o 404 (modelo no encontrado): pasar de inmediato al siguiente modelo
+        if (mapped.code === 'RATE_LIMIT' || mapped.code === 'MODEL_NOT_FOUND') {
+          break;
+        }
+
+        // 503 (UNAVAILABLE) / 500: reintentar máximo 1 vez con espera creciente (3s, 6s...)
+        if (mapped.code === 'SERVER_OVERLOADED') {
+          if (attempt < MAX_ATTEMPTS_PER_MODEL) {
+            await sleep(RETRY_BASE_DELAY_MS * attempt);
+            continue;
+          }
+          break;
+        }
+
+        // Cualquier otro error desconocido: detener
+        throw mapped;
+      }
+    }
+  }
+
+  if (lastError) {
+    const finalDetail =
+      attemptTrace.length > 1
+        ? `${lastError.technicalDetail ?? ''} (intentos: ${attemptTrace.length})`.trim()
+        : lastError.technicalDetail;
+    throw new OcrServiceError(
+      lastError.message,
+      lastError.code,
+      finalDetail,
+      lastError.model,
+      lastError.httpStatus,
+    );
+  }
+
+  throw new OcrServiceError(
+    'No hay modelos de Gemini configurados.',
+    'OTHER_ERROR',
+  );
 }
 
 /**
@@ -352,7 +495,10 @@ async function fetchGeminiGenerateContent(
  */
 export async function testGeminiApiKey(
   rawKey: string,
-): Promise<{ ok: true } | { ok: false; message: string; code: string; technicalDetail?: string }> {
+): Promise<
+  | { ok: true; model: string; technicalDetail: string }
+  | { ok: false; message: string; code: string; technicalDetail?: string }
+> {
   const apiKey = rawKey.trim();
   if (!apiKey) {
     return {
@@ -371,7 +517,7 @@ export async function testGeminiApiKey(
   }
 
   try {
-    await fetchGeminiGenerateContent(apiKey, {
+    const { model } = await fetchGeminiWithFallback(apiKey, {
       contents: [
         {
           role: 'user',
@@ -382,7 +528,11 @@ export async function testGeminiApiKey(
         maxOutputTokens: 16,
       },
     });
-    return { ok: true };
+    return {
+      ok: true,
+      model,
+      technicalDetail: `modelo: ${model}`,
+    };
   } catch (err) {
     const mapped = mapNetworkOrTimeoutError(err);
     return {
@@ -398,7 +548,11 @@ export async function testGeminiApiKey(
  * Valida y normaliza la respuesta JSON de Gemini para evitar errores
  * si faltan campos opcionales (ej. sin listas o sin título).
  */
-export function normalizeOcrResponse(raw: unknown, expectedPages: number): NormalizedOcrResult {
+export function normalizeOcrResponse(
+  raw: unknown,
+  expectedPages: number,
+  modelo: string = GEMINI_MODELS[0],
+): NormalizedOcrResult {
   const data = (raw && typeof raw === 'object' ? raw : {}) as Partial<GeminiOcrRawResponse>;
 
   const rawTitle = typeof data.titulo === 'string' ? data.titulo.trim() : '';
@@ -471,16 +625,21 @@ export function normalizeOcrResponse(raw: unknown, expectedPages: number): Norma
     origen_titulo,
     paginas,
     listas,
+    modelo,
   };
 }
 
-function extractTextFromGeminiRestResponse(json: Record<string, unknown>): string {
+function extractTextFromGeminiRestResponse(
+  json: Record<string, unknown>,
+  model: string,
+): string {
   const promptFeedback = json.promptFeedback as { blockReason?: string } | undefined;
   if (promptFeedback?.blockReason) {
     throw new OcrServiceError(
       'Gemini bloqueó el análisis de esta imagen por políticas de contenido.',
       'OTHER_ERROR',
-      `blockReason: ${promptFeedback.blockReason}`,
+      `modelo: ${model} · blockReason: ${promptFeedback.blockReason}`,
+      model,
     );
   }
 
@@ -496,7 +655,8 @@ function extractTextFromGeminiRestResponse(json: Record<string, unknown>): strin
     throw new OcrServiceError(
       'No obtuvimos respuesta del modelo para estas imágenes.',
       'OTHER_ERROR',
-      'candidates array vacío',
+      `modelo: ${model} · candidates array vacío`,
+      model,
     );
   }
 
@@ -513,7 +673,7 @@ function extractTextFromGeminiRestResponse(json: Record<string, unknown>): strin
 
 /**
  * Envía todas las páginas en una sola petición directa desde el navegador a Gemini
- * usando la clave personal del usuario en el encabezado x-goog-api-key.
+ * usando la clave personal del usuario en el encabezado x-goog-api-key y respaldo automático de modelos.
  * Comprime cada imagen a máx. 1600 px por lado y JPEG calidad 0.8 antes de enviar.
  */
 export async function analyzeHandwrittenPages(imageDataUrls: string[]): Promise<NormalizedOcrResult> {
@@ -556,7 +716,7 @@ export async function analyzeHandwrittenPages(imageDataUrls: string[]): Promise<
     text: `Lee las ${imageDataUrls.length} ${imageDataUrls.length === 1 ? 'página manuscrita' : 'páginas manuscritas'} y devuelve el JSON estructurado siguiendo todas las reglas.`,
   });
 
-  const apiJson = await fetchGeminiGenerateContent(apiKey, {
+  const { json: apiJson, model: modelUsed } = await fetchGeminiWithFallback(apiKey, {
     system_instruction: {
       parts: [{ text: OCR_SYSTEM_INSTRUCTION }],
     },
@@ -572,11 +732,13 @@ export async function analyzeHandwrittenPages(imageDataUrls: string[]): Promise<
     },
   });
 
-  const rawText = extractTextFromGeminiRestResponse(apiJson);
+  const rawText = extractTextFromGeminiRestResponse(apiJson, modelUsed);
   if (!rawText) {
     throw new OcrServiceError(
       'No obtuvimos texto legible de las imágenes. Prueba mejorando el contraste o acercando la hoja.',
       'EMPTY_RESPONSE',
+      `modelo: ${modelUsed} · respuesta vacía`,
+      modelUsed,
     );
   }
 
@@ -586,24 +748,28 @@ export async function analyzeHandwrittenPages(imageDataUrls: string[]): Promise<
   } catch (err) {
     const jsonMatch = rawText.match(/\{[\s\S]*\}/);
     if (!jsonMatch) {
+      const msg = err instanceof Error ? err.message : 'Invalid structured JSON';
       throw new OcrServiceError(
         'No se pudo interpretar la respuesta estructurada de Gemini. Inténtalo de nuevo.',
         'OTHER_ERROR',
-        err instanceof Error ? err.message : 'Invalid structured JSON',
+        `modelo: ${modelUsed} · ${msg}`,
+        modelUsed,
       );
     }
     try {
       parsed = JSON.parse(jsonMatch[0]);
     } catch (innerErr) {
+      const msg = innerErr instanceof Error ? innerErr.message : 'Invalid JSON block';
       throw new OcrServiceError(
         'No se pudo interpretar la respuesta estructurada de Gemini. Inténtalo de nuevo.',
         'OTHER_ERROR',
-        innerErr instanceof Error ? innerErr.message : 'Invalid JSON block',
+        `modelo: ${modelUsed} · ${msg}`,
+        modelUsed,
       );
     }
   }
 
-  const normalized = normalizeOcrResponse(parsed, imageDataUrls.length);
+  const normalized = normalizeOcrResponse(parsed, imageDataUrls.length, modelUsed);
   const hasContent =
     normalized.paginas.some((p) => p.texto.trim().length > 0) || normalized.listas.length > 0;
 
@@ -611,6 +777,8 @@ export async function analyzeHandwrittenPages(imageDataUrls: string[]): Promise<
     throw new OcrServiceError(
       'La imagen parece borrosa o sin texto manuscrito legible. Prueba recortando los bordes o mejorando el contraste.',
       'NO_TEXT_DETECTED',
+      `modelo: ${modelUsed}`,
+      modelUsed,
     );
   }
 

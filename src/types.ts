@@ -72,6 +72,7 @@ export interface ScanRecord {
   updatedAt: string;
   paginas: ScanPageRecord[];
   listas: OcrListGroup[];
+  modelo?: string;
   isDemo?: boolean;
 }
 

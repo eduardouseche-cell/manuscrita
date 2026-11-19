@@ -36,7 +36,11 @@ export function ApiKeyOnboardingView({
     try {
       const res = await testGeminiApiKey(apiKeyInput);
       if (res.ok) {
-        setFeedback({ type: 'success', message: '✓ Clave válida' });
+        setFeedback({
+          type: 'success',
+          message: '✓ Clave válida',
+          technicalDetail: res.technicalDetail,
+        });
       } else {
         setFeedback({
           type: 'error',

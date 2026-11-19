@@ -283,6 +283,7 @@ export default function App() {
           ocrResult.paginas,
         ),
         listas: ocrResult.listas,
+        modelo: ocrResult.modelo,
         isDemo: isDemoSession,
       };
 
@@ -339,6 +340,7 @@ export default function App() {
           texto: ocrResult.paginas[idx]?.texto ?? '',
         })),
         listas: ocrResult.listas,
+        modelo: ocrResult.modelo,
         isDemo: false,
       };
       setActiveScan(updatedScan);

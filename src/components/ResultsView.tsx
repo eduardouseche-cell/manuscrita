@@ -135,6 +135,14 @@ export function ResultsView({
             <span className="tabular-nums">
               {scan.paginas.length} {scan.paginas.length === 1 ? 'página' : 'páginas'}
             </span>
+            {scan.modelo && !scan.isDemo && (
+              <>
+                <span aria-hidden="true">·</span>
+                <span className="text-[11px] font-mono text-zinc-400 dark:text-zinc-500">
+                  modelo: {scan.modelo}
+                </span>
+              </>
+            )}
           </div>
 
           <input

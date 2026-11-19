@@ -51,7 +51,6 @@ export default defineConfig(() => {
           maximumFileSizeToCacheInBytes: 5 * 1024 * 1024,
           globPatterns: ['**/*.{js,css,html,ico,png,svg,ttf,woff,woff2}'],
           navigateFallback: 'index.html',
-          navigateFallbackDenylist: [/^\/api/],
           // NUNCA cachear ni interceptar llamadas a la API de Gemini (generativelanguage.googleapis.com)
           runtimeCaching: [
             {

@@ -61,7 +61,11 @@ export function SettingsView({
     try {
       const result = await testGeminiApiKey(apiKeyInput);
       if (result.ok) {
-        setTestFeedback({ type: 'success', message: '✓ Clave válida' });
+        setTestFeedback({
+          type: 'success',
+          message: '✓ Clave válida',
+          technicalDetail: result.technicalDetail,
+        });
       } else {
         setTestFeedback({
           type: 'error',
